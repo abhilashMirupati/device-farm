@@ -7,6 +7,8 @@ import { DevicePlugin } from './plugin';
 import log from './logger';
 import { updatedAllocatedDevice } from './data-service/device-service';
 import { getFreePort } from './helpers';
+import { existsSync } from 'fs';
+import { spawnSync } from 'child_process';
 
 export enum DEVICE_FARM_CAPABILITIES {
   BUILD_NAME = 'build',
@@ -104,44 +106,103 @@ export async function iOSCapabilities(
     options.portRange,
   );
   if (freeDevice.realDevice && !caps.firstMatch[0]['df:skipReport']) {
-    log.info(`[WDA Setup] Starting WDA setup for device: ${freeDevice.udid}, platform: ${freeDevice.platform}`);
-    
+    log.info(
+      `[WDA Setup] Starting WDA setup for device: ${freeDevice.udid}, platform: ${freeDevice.platform}, skipReport=${Boolean(
+        caps.firstMatch[0]['df:skipReport'],
+      )}`,
+    );
+
+    const hasCustomWDAUrl = Boolean(
+      caps.alwaysMatch?.['appium:webDriverAgentUrl'] || caps.firstMatch[0]['appium:webDriverAgentUrl'],
+    );
+    const derivedDataPath =
+      caps.alwaysMatch?.['appium:derivedDataPath'] ?? caps.firstMatch[0]['appium:derivedDataPath'];
+
+    if (derivedDataPath) {
+      freeDevice.derivedDataPath = derivedDataPath;
+      log.info(`[WDA Setup] Using derivedDataPath from capabilities: ${derivedDataPath}`);
+    } else {
+      log.debug('[WDA Setup] No derivedDataPath capability provided; xcuitest will use the default location.');
+    }
+
+    const goIOSRaw = process.env.GO_IOS?.trim();
+    const goIOSPath = goIOSRaw?.length ? goIOSRaw : undefined;
+    let goIOSAvailable = false;
+
+    if (goIOSPath) {
+      if (existsSync(goIOSPath)) {
+        goIOSAvailable = true;
+        log.info('[WDA Setup] GO_IOS environment variable detected and path validated.');
+        log.debug(`[WDA Setup] GO_IOS path: ${goIOSPath}`);
+      } else {
+        log.error(`[WDA Setup] GO_IOS path invalid: ${goIOSPath}.`);
+        log.warn('[WDA Setup] GO_IOS will be ignored for this session. Falling back to database or dynamic WDA build.');
+      }
+    } else {
+      log.debug('[WDA Setup] GO_IOS environment variable not set.');
+    }
+
     const wdaFileName = freeDevice.platform === 'tvos' ? 'wda-resign_tvos.ipa' : 'wda-resign.ipa';
-    log.debug(`[WDA Setup] Looking for WDA file: ${wdaFileName} in database`);
-    
+    let wdaInfo: { appBundleId: string } | null = null;
+
     try {
-      const wdaInfo = await prisma.appInformation.findFirst({
-        where: { fileName: wdaFileName },
-      });
-      
-      log.info(`[WDA Setup] Database lookup result: ${wdaInfo ? 'Found' : 'Not found'}`);
-      log.debug(`[WDA Setup] GO_IOS env var: ${process.env.GO_IOS ? 'Set' : 'Not set'}`);
-      
-      // FIX: Check GO_IOS first (even when wdaInfo is null) - This fixes the issue on fresh start
-      if (process.env.GO_IOS && !caps.alwaysMatch?.['appium:webDriverAgentUrl']) {
+      if (goIOSAvailable) {
+        log.debug('[WDA Setup] Skipping WDA database lookup because GO_IOS mode is active.');
+      } else {
+        log.debug(`[WDA Setup] Looking for WDA file: ${wdaFileName} in database`);
+        wdaInfo = await prisma.appInformation.findFirst({
+          where: { fileName: wdaFileName },
+        });
+        log.info(`[WDA Setup] Database lookup result: ${wdaInfo ? 'Found' : 'Not found'}`);
+      }
+
+      if (goIOSAvailable && !hasCustomWDAUrl) {
         log.info(`[WDA Setup] Using GO_IOS mode - Setting webDriverAgentUrl for device ${freeDevice.udid}`);
-        log.debug(`[WDA Setup] webDriverAgentHost: ${freeDevice.webDriverAgentHost}, wdaLocalPort: ${freeDevice.wdaLocalPort}`);
-        
+        log.debug(
+          `[WDA Setup] webDriverAgentHost: ${freeDevice.webDriverAgentHost}, wdaLocalPort: ${freeDevice.wdaLocalPort}`,
+        );
+
         caps.firstMatch[0]['appium:webDriverAgentUrl'] =
           freeDevice.webDriverAgentUrl = `${freeDevice.webDriverAgentHost}:${freeDevice.wdaLocalPort}`;
         delete caps.firstMatch[0]['appium:wdaLocalPort'];
-        
-        log.info(`[WDA Setup] ✅ Successfully set webDriverAgentUrl: ${freeDevice.webDriverAgentUrl}`);
-      } else if (wdaInfo && !process.env.GO_IOS) {
+        delete caps.firstMatch[0]['appium:usePreinstalledWDA'];
+        delete caps.firstMatch[0]['appium:updatedWDABundleId'];
+        delete caps.firstMatch[0]['appium:updatedWDABundleIdSuffix'];
+
+        log.info(`[WDA Setup] Successfully set webDriverAgentUrl: ${freeDevice.webDriverAgentUrl}`);
+      } else if (goIOSAvailable && hasCustomWDAUrl) {
+        log.info('[WDA Setup] GO_IOS is configured but webDriverAgentUrl capability already provided. Leaving it untouched.');
+      } else if (wdaInfo) {
         log.info(`[WDA Setup] Using prebuilt WDA mode for device ${freeDevice.udid}`);
         log.debug(`[WDA Setup] Bundle ID: ${wdaInfo.appBundleId}`);
-        
+
         caps.firstMatch[0]['appium:usePreinstalledWDA'] = true;
         caps.firstMatch[0]['appium:updatedWDABundleId'] = wdaInfo.appBundleId;
         caps.firstMatch[0]['appium:updatedWDABundleIdSuffix'] = '';
-        
-        log.info(`[WDA Setup] ✅ Successfully configured preinstalled WDA with bundleId: ${wdaInfo.appBundleId}`);
+
+        log.info(`[WDA Setup] Successfully configured preinstalled WDA with bundleId: ${wdaInfo.appBundleId}`);
       } else {
-        log.warn(`[WDA Setup] ⚠️  No WDA configuration set - wdaInfo: ${wdaInfo ? 'exists' : 'null'}, GO_IOS: ${process.env.GO_IOS ? 'set' : 'not set'}`);
-        log.warn(`[WDA Setup] xcuitest driver may build WDA automatically or session may fail`);
+        const derivedDataMessage = derivedDataPath
+          ? `WDA will be built inside: ${derivedDataPath}`
+          : 'WDA will be built using Xcode\'s default DerivedData location.';
+        log.warn(
+          `[WDA Setup] Warning: no WDA preconfiguration available - wdaInfo: ${wdaInfo ? 'exists' : 'null'}, GO_IOS: ${
+            goIOSAvailable ? 'configured' : 'not set'
+          }, custom URL: ${hasCustomWDAUrl ? 'provided' : 'not provided'}.`,
+        );
+        log.info(`[WDA Setup] ${derivedDataMessage}`);
+
+        const xcodeCheck = checkXcodeAvailability();
+        if (xcodeCheck.available) {
+          log.info(`[WDA Setup] Xcode detected. Derived data base path: ${xcodeCheck.message}`);
+        } else {
+          log.warn(
+            `[WDA Setup] ${xcodeCheck.message}. Install Xcode (with command line tools) or configure GO_IOS to avoid build failures.`,
+          );
+        }
       }
     } catch (error: any) {
-      log.error(`[WDA Setup] ❌ ERROR during WDA setup for device ${freeDevice.udid}:`);
+      log.error(`[WDA Setup] Error during WDA setup for device ${freeDevice.udid}:`);
       log.error(`[WDA Setup] Error message: ${error.message}`);
       log.error(`[WDA Setup] Error stack: ${error.stack}`);
       throw error; // Re-throw to ensure error is not silently swallowed
@@ -158,6 +219,8 @@ export async function iOSCapabilities(
     'appium:app',
   ];
 
+  deleteMatch.push('appium:usePreinstalledWDA', 'appium:updatedWDABundleId', 'appium:updatedWDABundleIdSuffix');
+
   if (!options.liveVideo) {
     deleteMatch.push('appium:mjpegServerPort');
   }
@@ -167,6 +230,36 @@ export async function iOSCapabilities(
     mjpegServerPort: freeDevice.mjpegServerPort,
     webDriverAgentUrl: freeDevice.webDriverAgentUrl,
   });
+}
+
+function checkXcodeAvailability(): { available: boolean; message: string } {
+  if (process.platform !== 'darwin') {
+    return {
+      available: false,
+      message: `Xcode not detected on ${process.platform}. macOS with Xcode is required for dynamic WDA builds`,
+    };
+  }
+
+  try {
+    const result = spawnSync('xcode-select', ['-p'], { encoding: 'utf-8' });
+    if (result.status === 0) {
+      const location = (result.stdout || result.stderr || '').trim();
+      return {
+        available: true,
+        message: location || 'xcode-select reported an empty developer directory',
+      };
+    }
+    const errorText = (result.stderr || result.stdout || '').trim();
+    return {
+      available: false,
+      message: errorText || 'xcode-select -p exited with a non-zero status',
+    };
+  } catch (error: any) {
+    return {
+      available: false,
+      message: `xcode-select check failed: ${error.message}`,
+    };
+  }
 }
 
 export function getDeviceFarmCapabilities(caps: ISessionCapability) {
