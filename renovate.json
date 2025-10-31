@@ -1,0 +1,12 @@
+{
+  "extends": [
+    "config:base",
+    ":semanticCommitTypeAll(ci)"
+  ],
+  "packageRules": [
+        {
+          "updateTypes": ["patch", "pin", "digest", "minor"],
+          "automerge": true
+        }
+      ]
+}

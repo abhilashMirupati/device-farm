@@ -1,0 +1,9 @@
+docs/*
+test/*
+.eslintrc
+.vscode
+.github
+documentation
+.github
+.circleci
+test
