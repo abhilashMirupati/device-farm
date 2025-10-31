@@ -1,0 +1,541 @@
+import chai from 'chai';
+import ip from 'ip';
+import sinon from 'sinon';
+import sinonChai from 'sinon-chai';
+import { Container } from 'typedi';
+import { v4 as uuidv4 } from 'uuid';
+import { ATDRepository } from '../../src/data-service/db';
+import * as DeviceService from '../../src/data-service/device-service';
+import { addNewDevice } from '../../src/data-service/device-service';
+import { DeviceFarmManager } from '../../src/device-managers';
+import * as DeviceUtils from '../../src/device-utils';
+import { allocateDeviceForSession } from '../../src/device-utils';
+import { IDevice } from '../../src/interfaces/IDevice';
+import { DefaultPluginArgs } from '../../src/interfaces/IPluginArgs';
+import { prisma } from '../../src/prisma';
+import { sessionRequestMap } from '../../src/proxy/wd-command-proxy';
+
+chai.should();
+chai.use(sinonChai);
+const expect = chai.expect;
+const sandbox = sinon.createSandbox();
+const NODE_ID = uuidv4();
+const REQUEST_ID = uuidv4();
+
+sessionRequestMap.set(REQUEST_ID, {} as any);
+
+describe('Device Utils', () => {
+  before(async () => {
+    // Insert a Node record for foreign key constraint in both LokiJS and Prisma
+    const nodeModel =
+      (await ATDRepository.db).getCollection('nodes') ||
+      (await ATDRepository.db).addCollection('nodes');
+    nodeModel.insert({
+      id: NODE_ID,
+      name: 'Test Node',
+      host: 'localhost',
+      os: 'linux',
+      jwtSecretToken: 'secret',
+      isHub: false,
+      isOnline: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    // Also create the node in Prisma database for foreign key constraint
+    await prisma.node.upsert({
+      where: { id: NODE_ID },
+      update: {},
+      create: {
+        id: NODE_ID,
+        name: 'Test Node',
+        host: 'localhost',
+        os: 'linux',
+        jwtSecretToken: 'secret',
+        isHub: false,
+        isOnline: true,
+      },
+    });
+  });
+
+  after(async () => {
+    // Clean up Prisma database
+    await prisma.device.deleteMany({});
+    await prisma.node.deleteMany({});
+  });
+  const hub1Device = {
+    id: 'dev-utils-1',
+    systemPort: 56205,
+    sdk: '10',
+    realDevice: true,
+    name: 'emulator-5555',
+    busy: false,
+    state: 'device',
+    udid: 'emulator-5555',
+    tags: ['team1', 'team33'],
+    platform: 'android',
+    deviceType: 'real',
+    host: 'http://192.168.0.225:4723',
+    totalUtilizationTimeMilliSec: 40778,
+    sessionStartTime: 1667113345897,
+    offline: false,
+    lastCmdExecutedAt: 1667113356356,
+    nodeId: NODE_ID,
+  };
+  const hub2Device = {
+    id: 'dev-utils-2',
+    systemPort: 56205,
+    sdk: '10',
+    realDevice: true,
+    name: 'emulator-5555',
+    tags: ['team22', 'teamAutomation'],
+    busy: false,
+    state: 'device',
+    udid: 'emulator-5555',
+    platform: 'android',
+    deviceType: 'real',
+    host: 'http://192.168.0.226:4723',
+    totalUtilizationTimeMilliSec: 40778,
+    sessionStartTime: 1667113345897,
+    offline: false,
+    lastCmdExecutedAt: 1667113356356,
+    nodeId: NODE_ID,
+  };
+  const localDeviceiOS = {
+    id: 'dev-utils-3',
+    name: 'iPhone SE (3rd generation)',
+    udid: '14C1078F-74C1-4672-BDB7-B65FC85FBFB4',
+    state: 'Shutdown',
+    sdk: '16.0',
+    platform: 'ios',
+    wdaLocalPort: 53712,
+    busy: false,
+    realDevice: false,
+    deviceType: 'simulator',
+    host: `http://${ip.address()}:4723`,
+    totalUtilizationTimeMilliSec: 0,
+    sessionStartTime: 0,
+    offline: false,
+    nodeId: NODE_ID,
+  };
+
+  // device with no host
+  const noHostDevice = {
+    id: 'dev-utils-4',
+    systemPort: 56205,
+    sdk: '10',
+    realDevice: true,
+    name: 'emulator-9999',
+    busy: false,
+    state: 'device',
+    udid: 'emulator-9999',
+    platform: 'android',
+    deviceType: 'real',
+    totalUtilizationTimeMilliSec: 40778,
+    sessionStartTime: 1667113345897,
+    offline: false,
+    lastCmdExecutedAt: 1667113356356,
+    userBlocked: false,
+    nodeId: NODE_ID,
+    host: 'unknown',
+  };
+
+  const devices = [hub1Device, hub2Device, localDeviceiOS, noHostDevice] as unknown as IDevice[];
+
+  const pluginArgs = Object.assign({}, DefaultPluginArgs, {
+    remote: [`http://${ip.address()}:4723`],
+    iosDeviceType: 'both',
+    androidDeviceType: 'both',
+  });
+
+  afterEach(function () {
+    sandbox.restore();
+  });
+
+  it('Allocate devices for session with host filter', async () => {
+    (await ATDRepository.DeviceModel).removeDataOnly();
+    const deviceManager = new DeviceFarmManager(
+      'android',
+      { androidDeviceType: 'both', iosDeviceType: 'both' },
+      4723,
+      Object.assign(pluginArgs, { maxSessions: 3 }),
+      NODE_ID,
+    );
+    Container.set(DeviceFarmManager, deviceManager);
+    await addNewDevice(devices);
+    const capabilities = {
+      alwaysMatch: {
+        platformName: 'android',
+        'appium:app': '/Downloads/VodQA.apk',
+        'appium:deviceAvailabilityTimeout': 1800,
+        'appium:deviceRetryInterval': 100,
+        'df:filterByHost': 'http://192.168.0.226:4723',
+      },
+      firstMatch: [{}],
+    };
+    const allocatedDeviceForFirstSession = await DeviceUtils.allocateDeviceForSession(
+      REQUEST_ID,
+      capabilities,
+      1000,
+      1000,
+      pluginArgs,
+    );
+
+    async function getFilteredDevice(udid: string, host: string) {
+      return (await ATDRepository.DeviceModel).chain().find({ udid, host }).data();
+    }
+
+    const foundDevice = (
+      await getFilteredDevice(
+        allocatedDeviceForFirstSession.udid,
+        allocatedDeviceForFirstSession.host,
+      )
+    )[0];
+
+    expect(foundDevice.busy).to.be.true;
+    await allocateDeviceForSession(REQUEST_ID, capabilities, 1000, 1000, pluginArgs).catch(
+      (error) =>
+        expect(error)
+          .to.be.an('error')
+          .with.property(
+            'message',
+            'No device matching request.. Device request: {"platform":"android","udid":["emulator-5555"],"filterByHost":"http://192.168.0.226:4723"}',
+          ),
+    );
+  });
+
+  it('Allocate devices for session with tag filter', async () => {
+    (await ATDRepository.DeviceModel).removeDataOnly();
+    const deviceManager = new DeviceFarmManager(
+      'android',
+      { androidDeviceType: 'both', iosDeviceType: 'both' },
+      4723,
+      Object.assign(pluginArgs, { maxSessions: 3 }),
+      NODE_ID,
+    );
+    Container.set(DeviceFarmManager, deviceManager);
+    await addNewDevice(devices);
+    const capabilities = {
+      alwaysMatch: {
+        platformName: 'android',
+        'appium:app': '/Downloads/VodQA.apk',
+        'appium:deviceAvailabilityTimeout': 1800,
+        'appium:deviceRetryInterval': 100,
+        'df:options': {
+          tags: ['team1', 'teamAutomation'],
+        },
+      },
+      firstMatch: [{}],
+    };
+    const allocatedDeviceForFirstSession = await DeviceUtils.allocateDeviceForSession(
+      REQUEST_ID,
+      capabilities,
+      1000,
+      1000,
+      pluginArgs,
+    );
+
+    async function getFilteredDevice(udid: string, host: string) {
+      return (await ATDRepository.DeviceModel).chain().find({ udid, host }).data();
+    }
+
+    const foundDevice = (
+      await getFilteredDevice(
+        allocatedDeviceForFirstSession.udid,
+        allocatedDeviceForFirstSession.host,
+      )
+    )[0];
+    expect(foundDevice.tags).to.be.deep.eq(['team1', 'team33']);
+    const allocatedDeviceForSecondSession = await DeviceUtils.allocateDeviceForSession(
+      REQUEST_ID,
+      capabilities,
+      1000,
+      1000,
+      pluginArgs,
+    );
+    const foundSecondDevice = (
+      await getFilteredDevice(
+        allocatedDeviceForSecondSession.udid,
+        allocatedDeviceForSecondSession.host,
+      )
+    )[0];
+    expect(foundSecondDevice.tags).to.be.deep.eq(['team22', 'teamAutomation']);
+    await allocateDeviceForSession(REQUEST_ID, capabilities, 1000, 1000, pluginArgs).catch(
+      (error) =>
+        expect(error)
+          .to.be.an('error')
+          .with.property(
+            'message',
+            'No device matching request.. Device request: {"platform":"android","udid":["emulator-5555"],"tags":["team1","teamAutomation"]}',
+          ),
+    );
+  });
+  it('Allocating device should set device to be busy', async function () {
+    (await ATDRepository.DeviceModel).removeDataOnly();
+    const deviceManager = new DeviceFarmManager(
+      'android',
+      { androidDeviceType: 'both', iosDeviceType: 'both' },
+      4723,
+      Object.assign(pluginArgs, { maxSessions: 3 }),
+      NODE_ID,
+    );
+    Container.set(DeviceFarmManager, deviceManager);
+    await addNewDevice(devices);
+    const capabilities = {
+      alwaysMatch: {
+        platformName: 'android',
+        'appium:app': '/Downloads/VodQA.apk',
+        'appium:deviceAvailabilityTimeout': 1800,
+        'appium:deviceRetryInterval': 100,
+      },
+      firstMatch: [{}],
+    };
+    const allocatedDeviceForFirstSession = await DeviceUtils.allocateDeviceForSession(
+      REQUEST_ID,
+      capabilities,
+      1000,
+      1000,
+      pluginArgs,
+    );
+
+    async function getFilteredDevice(udid: string, host: string) {
+      return (await ATDRepository.DeviceModel).chain().find({ udid, host }).data();
+    }
+
+    const foundDevice = (
+      await getFilteredDevice(
+        allocatedDeviceForFirstSession.udid,
+        allocatedDeviceForFirstSession.host,
+      )
+    )[0];
+
+    expect(foundDevice.busy).to.be.true;
+
+    let filterDeviceWithSameUDID = (await ATDRepository.DeviceModel)
+      .chain()
+      .find({ udid: allocatedDeviceForFirstSession.udid })
+      .data();
+    expect(filterDeviceWithSameUDID.length).to.be.equal(2);
+    // one device should be busy and the other is not
+    filterDeviceWithSameUDID.filter((device) => device.busy).length.should.be.equal(1);
+    filterDeviceWithSameUDID.filter((device) => !device.busy).length.should.be.equal(1);
+
+    const allocatedDeviceForSecondSession = await DeviceUtils.allocateDeviceForSession(
+      REQUEST_ID,
+      capabilities,
+      1000,
+      1000,
+      pluginArgs,
+    );
+    // allocatedDeviceForSecondSession should not be the same as allocatedDeviceForFirstSession
+    expect(allocatedDeviceForFirstSession).to.not.be.equal(allocatedDeviceForSecondSession);
+
+    const foundSecondDevice = (await ATDRepository.DeviceModel)
+      .chain()
+      .find({
+        udid: allocatedDeviceForSecondSession.udid,
+        host: allocatedDeviceForSecondSession.host,
+      })
+      .data()[0];
+
+    // check that the device is busy
+    filterDeviceWithSameUDID = (await ATDRepository.DeviceModel)
+      .chain()
+      .find({ udid: allocatedDeviceForFirstSession.udid })
+      .data();
+    expect(filterDeviceWithSameUDID[0].busy).to.be.true;
+    expect(filterDeviceWithSameUDID[1].busy).to.be.true;
+    expect(foundSecondDevice.busy).to.be.true;
+
+    await allocateDeviceForSession(REQUEST_ID, capabilities, 1000, 1000, pluginArgs).catch(
+      (error) =>
+        expect(error)
+          .to.be.an('error')
+          .with.property(
+            'message',
+            'No device matching request.. Device request: {"platform":"android","udid":["emulator-5555"]}',
+          ),
+    );
+  });
+
+  it('should release blocked devices that have no activity for more than the timeout', async () => {
+    // Mock the dependencies and setup the test data
+    const getAllDevicesMock = () => [
+      {
+        id: 'dev-utils-mock-1',
+        udid: 'device1',
+        busy: true,
+        host: ip.address(),
+        lastCmdExecutedAt:
+          new Date().getTime() - (DefaultPluginArgs.newCommandTimeoutSec + 5) * 1000,
+        nodeId: NODE_ID,
+        sdk: '1.0',
+      },
+      {
+        id: 'dev-utils-mock-2',
+        udid: 'device2',
+        busy: true,
+        host: ip.address(),
+        lastCmdExecutedAt: new Date().getTime() - 30000,
+        newCommandTimeout: 20000 / 1000,
+        nodeId: NODE_ID,
+        sdk: '1.0',
+      },
+      {
+        id: 'dev-utils-mock-3',
+        udid: 'device3',
+        busy: true,
+        host: ip.address(),
+        lastCmdExecutedAt: new Date().getTime(),
+        nodeId: NODE_ID,
+        sdk: '1.0',
+      },
+      {
+        id: 'dev-utils-mock-4',
+        udid: 'device4',
+        busy: true,
+        host: 'unknown',
+        nodeId: NODE_ID,
+        sdk: '1.0',
+      },
+    ];
+
+    sandbox.stub(DeviceService, 'getAllDevices').callsFake(getAllDevicesMock as any);
+
+    const unblockDeviceMock = sandbox.stub(DeviceService, 'unblockDevice').callsFake(sinon.fake());
+
+    // Call the function under test
+    await DeviceUtils.releaseBlockedDevices(DefaultPluginArgs.newCommandTimeoutSec);
+
+    // Verify the expected behavior
+    unblockDeviceMock.should.have.been.calledTwice;
+    unblockDeviceMock.should.have.been.calledWith('device1', ip.address());
+    unblockDeviceMock.should.have.been.calledWith('device2', ip.address());
+    unblockDeviceMock.should.not.have.been.calledWith('device3', ip.address());
+    unblockDeviceMock.should.not.have.been.calledWith('device3', ip.address());
+  });
+
+  it('should release device on node that is not used for more than the timeout', async () => {
+    // spec: we have devices from different hosts, all of them are busy and one of them is not used for more than the timeout
+    const getAllDevicesMock = () => [
+      {
+        id: 'dev-utils-mock-5',
+        udid: 'device1',
+        busy: true,
+        host: 'http://anotherhost:4723',
+        lastCmdExecutedAt: new Date().getTime() - 30000,
+        newCommandTimeout: 20000 / 1000,
+        nodeId: NODE_ID,
+        sdk: '1.0',
+      },
+      {
+        id: 'dev-utils-mock-6',
+        udid: 'device2',
+        busy: true,
+        host: ip.address(),
+        lastCmdExecutedAt: new Date().getTime(),
+        nodeId: NODE_ID,
+        sdk: '1.0',
+      },
+      // user blocked device
+      {
+        id: 'dev-utils-mock-7',
+        udid: 'device3',
+        busy: true,
+        host: ip.address(),
+        userBlocked: true,
+        lastCmdExecutedAt: new Date().getTime() - 30000,
+        newCommandTimeout: 20000 / 1000,
+        nodeId: NODE_ID,
+        sdk: '1.0',
+      },
+    ];
+
+    sandbox.stub(DeviceService, 'getAllDevices').callsFake(getAllDevicesMock as any);
+
+    const unblockDeviceMock = sandbox.stub(DeviceService, 'unblockDevice').callsFake(sinon.fake());
+
+    // calling releaseBlockedDevices should release the device on anotherhost
+    await DeviceUtils.releaseBlockedDevices(DefaultPluginArgs.newCommandTimeoutSec);
+
+    // Verify the expected behavior
+    unblockDeviceMock.should.have.been.calledOnce;
+    unblockDeviceMock.should.have.been.calledWith('device1', 'http://anotherhost:4723');
+    unblockDeviceMock.should.have.not.been.calledWith('device3', ip.address());
+  });
+
+  it('Block and unblock device', async () => {
+    (await ATDRepository.DeviceModel).removeDataOnly();
+    // mock setUtilizationTime
+    sandbox.stub(DeviceUtils, 'setUtilizationTime' as any).callsFake(sinon.fake());
+
+    const unbusyDevices = devices.map((device) => ({
+      ...device,
+      busy: false,
+    })) as unknown as IDevice[];
+    await addNewDevice(unbusyDevices);
+
+    const targetDevice = unbusyDevices[0];
+
+    // action: block device
+    await DeviceService.blockDevice(targetDevice.udid, targetDevice.host);
+
+    // assert device is busy
+    expect(
+      (await ATDRepository.DeviceModel)
+        .chain()
+        .find({ udid: targetDevice.udid, host: targetDevice.host })
+        .data()[0],
+    ).to.have.property('busy', true);
+
+    // set lastCommandTimestamp, otherwise it won't be picked up as device to unblock
+    (await ATDRepository.DeviceModel)
+      .chain()
+      .find({ udid: targetDevice.udid, host: targetDevice.host })
+      .update(function (device: IDevice) {
+        device.lastCmdExecutedAt = new Date().getTime();
+      });
+
+    let unblockCandidates = await DeviceUtils.unblockCandidateDevices();
+    //console.log(unblockCandidates);
+
+    // assert: device should be part of candidate list to unblock
+    expect(unblockCandidates.map((item) => item.udid)).to.include(targetDevice.udid);
+
+    // action: release blocked devices
+    await DeviceService.unblockDevice(targetDevice.udid, targetDevice.host);
+
+    // assert: device should not be part of candidate list to unblock
+    unblockCandidates = await DeviceUtils.unblockCandidateDevices();
+    expect((await unblockCandidates).map((item) => item.udid)).to.not.include(targetDevice.udid);
+
+    // assert: device should not have lastCommandTimestamp or it should be undefined
+
+    const device = (await ATDRepository.DeviceModel)
+      .chain()
+      .find({ udid: targetDevice.udid, host: targetDevice.host })
+      .data()[0];
+    expect(device).to.be.not.undefined;
+    expect(device?.lastCmdExecutedAt).to.be.undefined;
+  });
+
+  it('should remove stale devices', async () => {
+    (await ATDRepository.DeviceModel).removeDataOnly();
+    const deviceManager = new DeviceFarmManager(
+      'android',
+      { androidDeviceType: 'both', iosDeviceType: 'both' },
+      4723,
+      Object.assign(pluginArgs, { maxSessions: 3 }),
+      NODE_ID,
+    );
+    Container.set(DeviceFarmManager, deviceManager);
+    addNewDevice(devices);
+
+    DeviceUtils.removeStaleDevices(pluginArgs.bindHostOrIp);
+
+    // assert emulator-9999 is removed
+    expect(
+      (await ATDRepository.DeviceModel).chain().find({ udid: 'emulator-9999' }).data().length,
+    ).to.be.equal(0);
+  });
+});
