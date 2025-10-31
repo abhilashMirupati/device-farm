@@ -1,0 +1,33 @@
+{
+  "server": {
+    "port": 31337,
+    "plugin": {
+      "device-farm": {
+        "platform": "both",
+        "removeDevicesFromDatabaseBeforeRunningThePlugin": true,
+        "cloud":
+          {
+            "cloudName": "browserstack",
+            "url": "http://hub-cloud.browserstack.com/wd/hub",
+            "devices": [
+              {
+                "deviceName": "Samsung Galaxy S21",
+                "os_version": "12.0",
+                "platform": "android"
+              },
+              {
+                "deviceName": "Samsung Galaxy S21",
+                "os_version": "12.0",
+                "platform": "android"
+              },
+              {
+                "deviceName": "iPhone XS",
+                "os_version": "15",
+                "platform": "ios"
+              }
+            ]
+          }
+      }
+    }
+  }
+}

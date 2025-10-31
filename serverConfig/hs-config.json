@@ -1,0 +1,22 @@
+{
+  "server": {
+    "port": 31337,
+    "plugin": {
+      "device-farm": {
+        "platform": "android",
+        "remoteConnectionTimeout": 120000,
+        "cloud": {
+          "cloudName": "headspin",
+          "url": "https://appium-canary.headspin.io/v0//wd/hub",
+          "devices": [
+            {
+              "platformVersion": "12",
+              "deviceName": "android",
+              "platform": "android"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

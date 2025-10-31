@@ -1,0 +1,21 @@
+{
+  "server": {
+    "port": 31337,
+    "plugin": {
+      "device-farm": {
+        "platform": "ios",
+        "cloud": {
+          "cloudName": "lambdatest",
+          "url": "https://mobile-hub.lambdatest.com/wd/hub",
+          "devices": [
+            {
+              "platformVersion": "14",
+              "deviceName": "iPhone.*",
+              "platform": "ios"
+            }
+          ]
+        }
+      }
+    }
+  }
+}
